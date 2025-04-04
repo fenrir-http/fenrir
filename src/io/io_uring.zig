@@ -13,16 +13,14 @@ const io_uring_cqe = linux.io_uring_cqe;
 const io_uring_sqe = linux.io_uring_sqe;
 const Intrusive = @import("../queue.zig").Intrusive;
 const Options = @import("options.zig").Options;
-const BufferPool = @import("buffer_pool.zig").BufferPool(.io_uring);
 const ex = @import("linux/io_uring_ex.zig");
 
 const log = std.log.scoped(.loop);
 
 /// Event notifier implementation based on io_uring.
-/// FIXME: Add error types
-pub fn Loop(comptime options: Options) type {
+pub fn LoopImpl(comptime options: Options) type {
     return struct {
-        const Self = @This();
+        const Loop = @This();
         /// io_uring instance
         ring: IO_Uring,
         /// count of CQEs that we're waiting to receive, includes;
@@ -36,7 +34,7 @@ pub fn Loop(comptime options: Options) type {
 
         /// TODO: Check io_uring capabilities of kernel.
         /// Initializes a new event loop backed by io_uring.
-        pub fn init() !Self {
+        pub fn init() !Loop {
             var flags: u32 = 0;
 
             // TODO: Make these optional.
@@ -50,17 +48,17 @@ pub fn Loop(comptime options: Options) type {
         }
 
         /// Deinitializes the event loop.
-        pub fn deinit(self: *Self) void {
+        pub fn deinit(self: *Loop) void {
             self.ring.deinit();
         }
 
         /// NOTE: experimental
-        pub inline fn hasIo(self: *const Self) bool {
+        pub inline fn hasIo(self: *const Loop) bool {
             return self.io_pending > 0 and self.unqueued.isEmpty();
         }
 
         /// Runs the event loop until all operations are completed.
-        pub fn run(self: *Self) !void {
+        pub fn run(self: *Loop) !void {
             var cqes: [512]io_uring_cqe = undefined;
 
             while (self.hasIo()) {
@@ -78,12 +76,12 @@ pub fn Loop(comptime options: Options) type {
 
                 // Run completions
                 while (self.completed.pop()) |c| {
-                    c.callback(self, c);
+                    c.perform(self);
                 }
             }
         }
 
-        fn flushCompletions(self: *Self, slice: []io_uring_cqe, wait_nr: u32) !void {
+        fn flushCompletions(self: *Loop, slice: []io_uring_cqe, wait_nr: u32) !void {
             var remaining = wait_nr;
 
             while (true) {
@@ -114,7 +112,7 @@ pub fn Loop(comptime options: Options) type {
             }
         }
 
-        fn flushSubmissions(self: *Self, slice: []io_uring_cqe) !void {
+        fn flushSubmissions(self: *Loop, slice: []io_uring_cqe) !void {
             while (true) {
                 _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
                     error.SignalInterrupt => continue,
@@ -131,7 +129,7 @@ pub fn Loop(comptime options: Options) type {
         }
 
         /// Registers a completion to the loop.
-        fn enqueue(self: *Self, c: *Completion) void {
+        fn enqueue(self: *Loop, c: *Completion) void {
             // get a submission queue entry
             const sqe = self.ring.get_sqe() catch |err| switch (err) {
                 //if SQE ring is full, the completion will be added to unqueued.
@@ -144,51 +142,73 @@ pub fn Loop(comptime options: Options) type {
                     log.err("received a completion with `none` operation", .{});
                     unreachable;
                 },
-                .read => |op| {
-                    sqe.prep_rw(.READ, op.handle, @intFromPtr(op.buffer.ptr), op.buffer.len, op.offset);
+                .read => {
+                    const metadata = c.getMetadata(.read, false);
+                    sqe.prep_rw(.READ, metadata.handle, @intFromPtr(metadata.base), metadata.len, @bitCast(@as(i64, -1)));
 
                     // we want to use direct descriptors
                     if (comptime options.io_uring.direct_descriptors_mode) {
                         sqe.flags |= linux.IOSQE_FIXED_FILE;
                     }
                 },
-                .write => |op| {
-                    sqe.prep_rw(.WRITE, op.handle, @intFromPtr(op.buffer.ptr), op.buffer.len, op.offset);
+                .write => {
+                    const metadata = c.getMetadata(.write, false);
+                    sqe.prep_rw(.WRITE, metadata.handle, @intFromPtr(metadata.base), metadata.len, @bitCast(@as(i64, -1)));
 
                     // we want to use direct descriptors
                     if (comptime options.io_uring.direct_descriptors_mode) {
                         sqe.flags |= linux.IOSQE_FIXED_FILE;
                     }
                 },
-                .connect => |*op| {
-                    sqe.prep_connect(op.socket, &op.addr.any, op.addr.getOsSockLen());
+                .writev => {
+                    const metadata = c.getMetadata(.writev, false);
+                    sqe.prep_writev(metadata.handle, @ptrCast(metadata.iovecs[0..metadata.nr_vecs]), comptime @bitCast(@as(i64, -1)));
+
+                    // We want to use direct descriptors.
+                    if (comptime options.io_uring.direct_descriptors_mode) {
+                        sqe.flags |= linux.IOSQE_FIXED_FILE;
+                    }
+                },
+                .connect => {
+                    const metadata = c.getMetadata(.connect, true);
+                    sqe.prep_connect(metadata.socket, &metadata.addr, metadata.socklen);
 
                     // we want to use direct descriptors
                     if (comptime options.io_uring.direct_descriptors_mode) {
                         sqe.flags |= linux.IOSQE_FIXED_FILE;
                     }
                 },
-                .accept => |*op| switch (comptime options.io_uring.direct_descriptors_mode) {
-                    true => {
-                        // NOTE: Direct descriptors don't support SOCK_CLOEXEC flag at the moment.
-                        // https://github.com/axboe/liburing/issues/1330
-                        sqe.prep_multishot_accept_direct(op.socket, &op.addr, &op.addr_size, 0);
-                        // op.socket is also a direct descriptor
-                        sqe.flags |= linux.IOSQE_FIXED_FILE;
-                    },
-                    // regular multishot accept
-                    false => sqe.prep_multishot_accept(op.socket, &op.addr, &op.addr_size, posix.SOCK.CLOEXEC),
+                .accept => {
+                    const metadata = c.getMetadata(.accept, true);
+
+                    switch (comptime options.io_uring.direct_descriptors_mode) {
+                        true => {
+                            // NOTE: Direct descriptors don't support SOCK_CLOEXEC flag at the moment.
+                            // https://github.com/axboe/liburing/issues/1330
+                            sqe.prep_multishot_accept_direct(metadata.socket, &metadata.addr, &metadata.socklen, 0);
+                            // op.socket is also a direct descriptor
+                            sqe.flags |= linux.IOSQE_FIXED_FILE;
+                        },
+                        // regular multishot accept
+                        false => sqe.prep_multishot_accept(metadata.socket, &metadata.addr, &metadata.socklen, posix.SOCK.CLOEXEC),
+                    }
                 },
-                .recv => |op| {
-                    sqe.prep_rw(.RECV, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
+                .recv => {
+                    const metadata = c.getMetadata(.recv, false);
+                    sqe.prep_rw(.RECV, metadata.socket, @intFromPtr(metadata.base), metadata.len, 0);
+                    // recv flags.
+                    sqe.rw_flags = metadata.flags;
 
                     // we want to use direct descriptors
                     if (comptime options.io_uring.direct_descriptors_mode) {
                         sqe.flags |= linux.IOSQE_FIXED_FILE;
                     }
                 },
-                .send => |op| {
-                    sqe.prep_rw(.SEND, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
+                .send => {
+                    const metadata = c.getMetadata(.send, false);
+                    sqe.prep_rw(.SEND, metadata.socket, @intFromPtr(metadata.base), metadata.len, 0);
+                    // send flags.
+                    sqe.rw_flags = metadata.flags;
 
                     // we want to use direct descriptors
                     if (comptime options.io_uring.direct_descriptors_mode) {
@@ -196,14 +216,18 @@ pub fn Loop(comptime options: Options) type {
                     }
                 },
                 // FIXME: IORING_TIMEOUT_ETIME_SUCCESS seems to have no effect here
-                .timeout => |*ts| sqe.prep_timeout(ts, 0, linux.IORING_TIMEOUT_ETIME_SUCCESS),
-                .fds_update => |op| switch (comptime options.io_uring.direct_descriptors_mode) {
-                    true => ex.io_uring_prep_files_update(sqe, op.fds, op.offset),
-                    false => unreachable,
+                .timeout => {
+                    const metadata = c.getMetadata(.timeout, true);
+                    sqe.prep_timeout(&metadata.timespec, 0, linux.IORING_TIMEOUT_ETIME_SUCCESS);
                 },
-                .close => |fd| switch (comptime options.io_uring.direct_descriptors_mode) {
-                    true => sqe.prep_close_direct(@intCast(fd)), // works similar to fds_update
-                    false => sqe.prep_close(fd),
+                .close => {
+                    const metadata = c.getMetadata(.close, false);
+
+                    if (comptime options.io_uring.direct_descriptors_mode) {
+                        sqe.prep_close_direct(@intCast(metadata.handle));
+                    } else {
+                        sqe.prep_close(metadata.handle);
+                    }
                 },
             }
 
@@ -215,7 +239,6 @@ pub fn Loop(comptime options: Options) type {
         }
 
         pub const ReadError = error{
-            EndOfStream,
             NotOpenForReading,
             ConnectionResetByPeer,
             Alignment,
@@ -228,7 +251,7 @@ pub fn Loop(comptime options: Options) type {
 
         /// Queues a read operation.
         pub fn read(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
@@ -236,7 +259,7 @@ pub fn Loop(comptime options: Options) type {
             buffer: []u8,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
                 buffer: []u8,
                 result: ReadError!usize,
@@ -244,22 +267,22 @@ pub fn Loop(comptime options: Options) type {
         ) void {
             completion.* = .{
                 .next = null,
-                .operation = .{
+                .operation = .read,
+                .metadata = .{
                     .read = .{
+                        .base = buffer.ptr,
+                        .len = buffer.len,
                         .handle = handle,
-                        .buffer = buffer,
-                        // offset is a u64 but if the value is -1 then it uses the offset in the fd.
-                        .offset = @bitCast(@as(i64, -1)),
                     },
                 },
                 .userdata = userdata,
-                // following is what happens when we receive a sqe for this completion.
-                .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                // We erase the type of function pointer here since we're using extern structs.
+                // Extern structs can only represent `*const anyopaque` for functions at most.
+                .callback = @ptrCast(&(comptime struct {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         const res = c.result;
 
-                        const result: ReadError!usize = if (res <= 0) switch (@as(posix.E, @enumFromInt(-res))) {
-                            .SUCCESS => error.EndOfStream,
+                        const result: Completion.OperationType.Returns(.read) = if (res < 0) switch (c.err()) {
                             .INTR, .AGAIN => {
                                 // Some file systems, like XFS, can return EAGAIN even when
                                 // reading from a blocking file without flags like RWF_NOWAIT.
@@ -281,11 +304,13 @@ pub fn Loop(comptime options: Options) type {
                             else => |err| posix.unexpectedErrno(err),
                         } else @intCast(res);
 
-                        const buf = c.operation.read.buffer;
+                        const metadata = c.getMetadata(.read, false);
+                        const buf = metadata.base[0..metadata.len];
+
                         // invoke the user provided callback
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, buf, result });
+                        @call(.always_inline, callback, .{ c.castUserdata(T), loop, c, buf, result });
                     }
-                }.wrap,
+                }.wrap)),
             };
 
             self.enqueue(completion);
@@ -307,7 +332,7 @@ pub fn Loop(comptime options: Options) type {
 
         /// Queues a write operation.
         pub fn write(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
@@ -315,31 +340,29 @@ pub fn Loop(comptime options: Options) type {
             buffer: []const u8,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
-                handle: Handle,
                 buffer: []const u8,
                 result: WriteError!usize,
             ) void,
         ) void {
             completion.* = .{
                 .next = null,
-                .operation = .{
+                .operation = .write,
+                .metadata = .{
                     .write = .{
+                        .base = buffer.ptr,
+                        .len = buffer.len,
                         .handle = handle,
-                        .buffer = buffer,
-                        // offset is a u64 but if the value is -1 then it uses the offset in the fd.
-                        .offset = comptime @bitCast(@as(i64, -1)),
                     },
                 },
                 .userdata = userdata,
                 // following is what happens when we receive a sqe for this completion.
-                .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                .callback = @ptrCast(&(comptime struct {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         const res = c.result;
 
-                        const result: Completion.OperationType.returnType(.write) = if (res <= 0) switch (@as(posix.E, @enumFromInt(-res))) {
-                            .SUCCESS => error.EndOfStream, // 0 read
+                        const result: Completion.OperationType.Returns(.write) = if (res < 0) switch (c.err()) {
                             .INTR => return loop.enqueue(completion),
                             .AGAIN => error.WouldBlock,
                             .BADF => error.NotOpenForWriting,
@@ -356,14 +379,15 @@ pub fn Loop(comptime options: Options) type {
                             .PERM => error.AccessDenied,
                             .PIPE => error.BrokenPipe,
                             .SPIPE => error.Unseekable,
-                            else => error.Unexpected,
+                            else => |err| posix.unexpectedErrno(err),
                         } else @intCast(res);
 
-                        const op = c.operation.write;
+                        const metadata = c.getMetadata(.write, false);
+                        const buf = metadata.base[0..metadata.len];
                         // invoke the user provided callback
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.handle, op.buffer, result });
+                        @call(.always_inline, callback, .{ c.castUserdata(T), loop, c, buf, result });
                     }
-                }.wrap,
+                }.wrap)),
             };
 
             self.enqueue(completion);
@@ -392,35 +416,35 @@ pub fn Loop(comptime options: Options) type {
 
         /// Queues a connect operation.
         pub fn connect(
-            self: *Self,
+            self: *Loop,
+            completion: *Completion,
             comptime T: type,
             userdata: *T,
-            completion: *Completion,
             s: Socket,
             addr: std.net.Address,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
-                socket: Socket,
-                addr: std.net.Address,
                 result: ConnectError!void,
             ) void,
         ) void {
             completion.* = .{
                 .next = null,
-                .operation = .{
+                .operation = .connect,
+                .metadata = .{
                     .connect = .{
+                        .addr = addr.any,
                         .socket = s,
-                        .addr = addr,
+                        .socklen = addr.getOsSockLen(),
                     },
                 },
                 .userdata = userdata,
-                .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                .callback = @ptrCast(&(comptime struct {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         const res = c.result;
 
-                        const result: Completion.OperationType.returnType(.connect) = if (res < 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                        const result: Completion.OperationType.Returns(.connect) = if (res < 0) switch (c.err()) {
                             .INTR => return loop.enqueue(c),
                             .ACCES => error.AccessDenied,
                             .ADDRINUSE => error.AddressInUse,
@@ -441,24 +465,22 @@ pub fn Loop(comptime options: Options) type {
                             .PERM => error.PermissionDenied,
                             .PROTOTYPE => error.ProtocolNotSupported,
                             .TIMEDOUT => error.ConnectionTimedOut,
-                            else => error.Unexpected,
+                            else => |err| posix.unexpectedErrno(err),
                         };
 
-                        const op = c.operation.connect;
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.addr, result });
+                        @call(.always_inline, callback, .{ c.castUserdata(T), loop, c, result });
                     }
-                }.wrap,
+                }.wrap)),
             };
 
             self.enqueue(completion);
         }
 
-        // error that's not really expected
+        // Error that's not really expected.
         pub const UnexpectedError = error{Unexpected};
-        // error that's used on operations that can be cancelled
+        // Error that's expected on operations that're cancelable.
         pub const CancellationError = error{Cancelled};
 
-        // possible errors accept can create
         pub const AcceptError = error{
             WouldBlock,
             ConnectionAborted,
@@ -471,38 +493,34 @@ pub fn Loop(comptime options: Options) type {
             ProtocolFailure,
         } || CancellationError || UnexpectedError;
 
-        /// Starts accepting connections for a given socket.
-        /// This a multishot operation, meaning it'll keep on running until it's either cancelled or encountered with an error.
-        /// Completions given to multishot operations MUST NOT be reused until the multishot operation is either cancelled or encountered with an error.
+        /// Start accepting connections for a given socket.
+        /// This a multishot operation, meaning it'll keep on running until it's either canceled or encountered with an error.
+        /// Completions given to multishot operations MUST NOT be reused until the multishot operation is either canceled or encountered with an error.
         pub fn accept(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
             s: Socket,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
-                socket: Socket,
                 result: AcceptError!Socket,
             ) void,
         ) void {
             completion.* = .{
                 .next = null,
-                .operation = .{
-                    .accept = .{
-                        .socket = s,
-                        .addr = undefined,
-                        .addr_size = @sizeOf(posix.sockaddr),
-                    },
+                .operation = .accept,
+                .metadata = .{
+                    .accept = .{ .socket = s },
                 },
                 .userdata = userdata,
-                .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                .callback = @ptrCast(&(comptime struct {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         const res = c.result;
 
-                        const result: Completion.OperationType.returnType(.accept) = if (res < 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                        const result: Completion.OperationType.Returns(.accept) = if (res < 0) switch (c.err()) {
                             .INTR => return loop.enqueue(c), // we're interrupted, try again
                             .AGAIN => error.WouldBlock,
                             .BADF => error.Unexpected,
@@ -518,28 +536,26 @@ pub fn Loop(comptime options: Options) type {
                             .PERM => error.PermissionDenied,
                             .PROTO => error.ProtocolFailure,
                             .CANCELED => error.Cancelled,
-                            else => error.Unexpected,
+                            else => |err| posix.unexpectedErrno(err),
                         } else res; // valid socket
 
-                        // we're accepting via `io_uring_prep_multishot_accept` so we have to increment pending for each successful accept request
-                        // to keep the loop running.
+                        // We're accepting via `io_uring_prep_multishot_accept`
+                        // so we have to increment pending for each successful accept request to keep the loop running.
                         // this must be done no matter what `cqe.res` is given.
                         if (c.flags & linux.IORING_CQE_F_MORE != 0) {
                             loop.io_pending += 1;
                         }
 
-                        const listener = c.operation.accept.socket;
                         // invoke the user provided callback
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, listener, result });
+                        @call(.always_inline, callback, .{ c.castUserdata(T), loop, c, result });
                     }
-                }.wrap,
+                }.wrap)),
             };
 
             self.enqueue(completion);
         }
 
         pub const RecvError = error{
-            EndOfStream,
             WouldBlock,
             SystemResources,
             OperationNotSupported,
@@ -552,36 +568,38 @@ pub fn Loop(comptime options: Options) type {
 
         /// Queues a recv operation.
         pub fn recv(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
             s: Socket,
             buffer: []u8,
+            flags: u32,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
-                socket: Socket,
                 buffer: []u8,
                 result: RecvError!usize,
             ) void,
         ) void {
             completion.* = .{
                 .next = null,
-                .operation = .{
+                .operation = .recv,
+                .metadata = .{
                     .recv = .{
+                        .base = buffer.ptr,
+                        .len = buffer.len,
                         .socket = s,
-                        .buffer = buffer,
+                        .flags = flags,
                     },
                 },
                 .userdata = userdata,
                 .callback = struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         const res = c.result;
 
-                        const result: RecvError!usize = if (res <= 0) switch (@as(posix.E, @enumFromInt(-res))) {
-                            .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
+                        const result: RecvError!usize = if (res < 0) switch (c.err()) {
                             .INTR => return loop.enqueue(c), // we're interrupted, try again
                             .AGAIN => error.WouldBlock,
                             .BADF => error.Unexpected,
@@ -596,105 +614,19 @@ pub fn Loop(comptime options: Options) type {
                             .TIMEDOUT => error.ConnectionTimedOut,
                             .OPNOTSUPP => error.OperationNotSupported,
                             .CANCELED => error.Cancelled,
-                            else => error.Unexpected,
+                            else => |err| posix.unexpectedErrno(err),
                         } else @intCast(res); // valid
 
-                        const op = c.operation.recv;
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer, result });
+                        const metadata = c.getMetadata(.recv, false);
+                        const buf = metadata[0..metadata.len];
+
+                        @call(.always_inline, callback, .{ c.castUserdata(T), loop, c, buf, result });
                     }
                 }.wrap,
             };
 
             self.enqueue(completion);
         }
-
-        //pub const RecvPooledError = RecvError || error{OutOfBuffers};
-
-        /// NOTE: Experimental.
-        ///
-        /// Queues a recv operation, this variant uses a provided buffer pool instead of a single buffer.
-        ///
-        /// io_uring supports a mechanism called provided buffers. The application sets
-        /// aside a pool of buffers, and informs io_uring of those buffers. This allows the kernel to
-        /// pick a suitable buffer when the given receive operation is ready to actually receive data,
-        /// rather than upfront. The CQE posted will then additionally hold information about
-        /// which buffer was picked.
-        /// https://kernel.dk/io_uring%20and%20networking%20in%202023.pdf
-        //pub fn recvPooled(
-        //    self: *Self,
-        //    completion: *Completion,
-        //    comptime T: type,
-        //    userdata: *T,
-        //    s: Socket,
-        //    buffer_pool: *BufferPool,
-        //    comptime callback: *const fn (
-        //        userdata: *T,
-        //        loop: *Self,
-        //        completion: *Completion,
-        //        socket: Socket,
-        //        buffer_pool: *BufferPool,
-        //        buffer_id: u16,
-        //        result: RecvPooledError!usize,
-        //    ) void,
-        //) void {
-        //    completion.* = .{
-        //        .next = null,
-        //        .operation = .{
-        //            .recv_bp = .{
-        //                .socket = s,
-        //                .buf_pool = buffer_pool,
-        //            },
-        //        },
-        //        .userdata = userdata,
-        //        .callback = struct {
-        //            fn wrap(loop: *Self, c: *Completion) void {
-        //                const res = c.result;
-        //                const flags = c.flags;
-        //                const op = c.operation.recv_bp;
-        //
-        //                const result: Completion.OperationType.returnType(.recv_bp) = if (res <= 0)
-        //                    switch (@as(posix.E, @enumFromInt(-res))) {
-        //                        .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
-        //                        .INTR => return loop.enqueue(c), // we're interrupted, try again
-        //                        .AGAIN => error.WouldBlock,
-        //                        .BADF => error.Unexpected,
-        //                        .CONNREFUSED => error.ConnectionRefused,
-        //                        .FAULT => unreachable,
-        //                        .INVAL => unreachable,
-        //                        .NOBUFS => error.OutOfBuffers,
-        //                        .NOMEM => error.SystemResources,
-        //                        .NOTCONN => error.SocketNotConnected,
-        //                        .NOTSOCK => error.Unexpected,
-        //                        .CONNRESET => error.ConnectionResetByPeer,
-        //                        .TIMEDOUT => error.ConnectionTimedOut,
-        //                        .OPNOTSUPP => error.OperationNotSupported,
-        //                        .CANCELED => error.Cancelled,
-        //                        else => error.Unexpected,
-        //                    }
-        //                else
-        //                    @intCast(res);
-        //
-        //                // which buffer did the worker pick from the pool?
-        //                const buffer_id: u16 = @intCast(flags >> linux.IORING_CQE_BUFFER_SHIFT);
-        //
-        //                // The application should check the flags of each CQE,
-        //                // regardless of its result. If a posted CQE does not have the
-        //                // IORING_CQE_F_MORE flag set then the multishot receive will be
-        //                // done and the application should issue a new request.
-        //                // https://man7.org/linux/man-pages/man3/io_uring_prep_recv_multishot.3.html
-        //                if (flags & linux.IORING_CQE_F_MORE != 0) {
-        //                    loop.io_pending += 1;
-        //                }
-        //
-        //                // NOTE: Currently its up to caller to give the buffer back to kernel.
-        //                // This behaviour might change in the future though.
-        //                @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buf_pool, buffer_id, result });
-        //            }
-        //        }.wrap,
-        //    };
-        //
-        //    self.enqueue(completion);
-        //}
 
         pub const SendError = error{
             AccessDenied,
@@ -714,37 +646,40 @@ pub fn Loop(comptime options: Options) type {
 
         /// Queues a send operation.
         pub fn send(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
             s: Socket,
             buffer: []const u8,
+            flags: u32,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
-                socket: Socket,
                 buffer: []const u8,
                 result: SendError!usize,
             ) void,
         ) void {
             completion.* = .{
                 .next = null,
-                .operation = .{
+                .operation = .send,
+                .metadata = .{
                     .send = .{
+                        .base = buffer.ptr,
+                        .len = buffer.len,
                         .socket = s,
-                        .buffer = buffer,
+                        .flags = flags,
                     },
                 },
                 .userdata = userdata,
-                .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                .callback = @ptrCast(&(comptime struct {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         const res = c.result;
 
                         const result: SendError!usize = blk: {
                             if (res < 0) {
-                                const err = switch (@as(posix.E, @enumFromInt(-res))) {
+                                const err = switch (c.err()) {
                                     .INTR => {
                                         loop.enqueue(completion);
                                         return;
@@ -777,11 +712,12 @@ pub fn Loop(comptime options: Options) type {
                             }
                         };
 
-                        // regular send operations
-                        const op = c.operation.send;
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer, result });
+                        const metadata = c.getMetadata(.send, false);
+                        const buf = metadata.base[0..metadata.len];
+
+                        @call(.always_inline, callback, .{ c.castUserdata(T), loop, c, buf, result });
                     }
-                }.wrap,
+                }.wrap)),
             };
 
             self.enqueue(completion);
@@ -793,14 +729,14 @@ pub fn Loop(comptime options: Options) type {
         /// Queues a timeout operation.
         /// nanoseconds are given as u63 for coercion to i64.
         pub fn timeout(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
             ns: u63,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
                 result: TimeoutError!void,
             ) void,
@@ -812,7 +748,7 @@ pub fn Loop(comptime options: Options) type {
                 },
                 .userdata = userdata,
                 .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         const res = c.result;
 
                         const result: TimeoutError!void = if (res < 0) switch (@as(posix.E, @enumFromInt(-res))) {
@@ -836,14 +772,14 @@ pub fn Loop(comptime options: Options) type {
         /// Queues a close operation.
         /// Supports both file descriptors and direct descriptors.
         pub fn close(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
             handle_or_socket: HandleOrSocket,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
             ) void,
         ) void {
@@ -852,7 +788,7 @@ pub fn Loop(comptime options: Options) type {
                 .operation = .{ .close = handle_or_socket },
                 .userdata = userdata,
                 .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         const res = c.result;
 
                         // According to Zen, close operations should not fail.
@@ -873,29 +809,29 @@ pub fn Loop(comptime options: Options) type {
         }
 
         /// Creates a new socket.
-        pub inline fn socket(_: Self, domain: u32, socket_type: u32, protocol: u32) !Socket {
+        pub inline fn socket(_: Loop, domain: u32, socket_type: u32, protocol: u32) !Socket {
             return posix.socket(domain, socket_type, protocol);
         }
 
         /// Sets REUSEADDR flag on a given socket.
-        pub inline fn setReuseAddr(_: Self, s: Socket) posix.SetSockOptError!void {
+        pub inline fn setReuseAddr(_: Loop, s: Socket) posix.SetSockOptError!void {
             return posix.setsockopt(s, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
         }
 
         /// Sets REUSEPORT flag on a given socket if possible.
-        pub inline fn setReusePort(_: Self, s: Socket) posix.SetSockOptError!void {
+        pub inline fn setReusePort(_: Loop, s: Socket) posix.SetSockOptError!void {
             if (@hasDecl(posix.SO, "REUSEPORT")) {
                 return posix.setsockopt(s, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
             }
         }
 
         /// Enables/disables TCP_NODELAY setting on a given socket.
-        pub inline fn setTcpNoDelay(_: Self, s: Socket, on: bool) posix.SetSockOptError!void {
+        pub inline fn setTcpNoDelay(_: Loop, s: Socket, on: bool) posix.SetSockOptError!void {
             return posix.setsockopt(s, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, @intFromBool(on))));
         }
 
         /// Enables/disables SO_KEEPALIVE setting on a given socket.
-        pub inline fn setTcpKeepAlive(_: Self, s: Socket, on: bool) posix.SetSockOptError!void {
+        pub inline fn setTcpKeepAlive(_: Loop, s: Socket, on: bool) posix.SetSockOptError!void {
             return posix.setsockopt(s, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, @intFromBool(on))));
         }
 
@@ -909,7 +845,7 @@ pub fn Loop(comptime options: Options) type {
         /// * `regular` option requires a constant array of file descriptors.
         /// * `sparse` option allocates an invalid (-1) array of direct descriptors for the ring. Good if you want to register file descriptors later on.
         pub fn directDescriptors(
-            self: *Self,
+            self: *Loop,
             comptime registration: Registration,
             array_or_u32: switch (registration) {
                 .regular => []const linux.fd_t,
@@ -932,7 +868,7 @@ pub fn Loop(comptime options: Options) type {
         /// Updates file descriptors. Starting from the `offset`.
         /// This function works synchronously, which might suit better for some situations.
         /// Check `updateDescriptorsAsync` function if you need asynchronous update.
-        pub fn updateDescriptorsSync(self: *Self, offset: u32, fds: []const linux.fd_t) !void {
+        pub fn updateDescriptorsSync(self: *Loop, offset: u32, fds: []const linux.fd_t) !void {
             if (comptime !options.io_uring.direct_descriptors_mode) {
                 @compileError("direct descriptors are not enabled");
             }
@@ -971,7 +907,7 @@ pub fn Loop(comptime options: Options) type {
         ///
         /// Queues an `io_uring_prep_files_update` operation, similar to `updateDescriptors` but happens in async manner.
         pub fn updateDescriptorsAsync(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
@@ -979,7 +915,7 @@ pub fn Loop(comptime options: Options) type {
             offset: u32, // NOTE: type of this might be a problem but I'm not totally sure
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
                 fds: []const linux.fd_t,
                 offset: u32,
@@ -1000,7 +936,7 @@ pub fn Loop(comptime options: Options) type {
                 },
                 .userdata = userdata,
                 .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         // get the result of this operation
                         const result = getUpdateFdsResult(c.result);
                         const op = c.operation.fds_update;
@@ -1018,14 +954,14 @@ pub fn Loop(comptime options: Options) type {
         /// Same as `updateDescriptorsAsync` but this variant doesn't take `offset` argument. Instead, it allocates fds
         /// to empty spots and fills the given `fds` slice with direct descriptors. Order is preserved.
         pub fn updateDescriptorsAsyncAlloc(
-            self: *Self,
+            self: *Loop,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
             fds: []linux.fd_t,
             comptime callback: *const fn (
                 userdata: *T,
-                loop: *Self,
+                loop: *Loop,
                 completion: *Completion,
                 fds: []linux.fd_t,
                 result: UpdateFdsError!i32, // result can only be max. int32 either
@@ -1045,7 +981,7 @@ pub fn Loop(comptime options: Options) type {
                 },
                 .userdata = userdata,
                 .callback = comptime struct {
-                    fn wrap(loop: *Self, c: *Completion) void {
+                    fn wrap(loop: *Loop, c: *Completion) void {
                         // get the result of this operation
                         const result = getUpdateFdsResult(c.result);
                         const op = c.operation.fds_update;
@@ -1060,115 +996,154 @@ pub fn Loop(comptime options: Options) type {
 
         // callback used for an empty Completion.
         const emptyCallback = struct {
-            fn callback(_: *Self, _: *Completion) void {}
+            fn callback(_: *Loop, _: *Completion) void {}
         }.callback;
 
         // Represents operations.
-        pub const Completion = struct {
+        pub const Completion = extern struct {
             /// Intrusively linked
             next: ?*Completion = null,
             /// Userdata and callback for when the completion is finished
             userdata: ?*anyopaque = null,
-            /// NOTE: IDK if null or undefined suit here better
-            callback: Callback = emptyCallback,
+            callback: *const anyopaque = @ptrCast(&emptyCallback),
             /// Result from the CQE, filled after the operation is completed.
             result: i32 = 0,
             /// This is used in two ways:
-            /// * When a completion is submitted, additional flags (SQE, send flags etc.) can be set here.
+            /// * When a completion is submitted, additional flags (SQE, send flags etc.) can be set here (currently not preferred).
             /// * When a completion is finished, CQE flags will be set here.
             flags: u32 = 0,
             /// Operation intended by this completion
-            operation: Operation = .none,
+            operation: OperationType = .none, // 1
+            /// Whether or not the completion is in the works.
+            /// TODO: Not implemented yet.
+            status: enum(u8) { idle, running } = .idle, // 1
+            /// This'll be given by compiler anyway, reserved here for future usage.
+            __pad: [6]u8 = undefined,
+            /// Various operation metadata.
+            metadata: Operation = .{ .none = {} }, // 24
 
-            // callback to be invoked when an operation is complete.
-            pub const Callback = *const fn (_: *Self, _: *Completion) void;
+            /// Type of callback that's invoked when an operation is complete.
+            pub const Callback = *const fn (_: *Loop, _: *Completion) void;
+
+            /// Adds type to `callback` since it's type-erased.
+            pub inline fn CallbackFn(completion: *const Completion) Callback {
+                return @ptrCast(completion.callback);
+            }
+
+            /// Executes the `callback` attached to this completion.
+            pub inline fn perform(completion: *Completion, loop: *Loop) void {
+                return @call(.auto, completion.CallbackFn(), .{ loop, completion });
+            }
+
+            /// Returns the metadata (or a pointer to it) for the desired operation.
+            pub inline fn getMetadata(completion: *Completion, comptime op: OperationType, comptime as_ptr: bool) blk: {
+                const Type = @FieldType(Operation, @tagName(op));
+                break :blk if (as_ptr) *Type else Type;
+            } {
+                if (comptime as_ptr) {
+                    return @ptrCast(&completion.metadata);
+                }
+
+                return @field(completion.metadata, @tagName(op));
+            }
+
+            pub inline fn castUserdata(completion: *const Completion, comptime T: type) *align(@alignOf(T)) T {
+                return @ptrCast(@alignCast(completion.userdata));
+            }
+
+            /// Whether or not the completion is in the works.
+            pub inline fn isAvailable(completion: *const Completion) bool {
+                return completion.status == .idle;
+            }
+
+            /// Interprets `result` as a POSIX error.
+            pub inline fn err(completion: *const Completion) posix.E {
+                return @enumFromInt(-completion.result);
+            }
 
             // operation kind
-            pub const OperationType = enum {
+            pub const OperationType = enum(u8) {
                 none,
                 read,
                 write,
+                writev,
                 connect,
                 accept,
                 recv,
                 send,
                 timeout,
                 //cancel,
-                fds_update,
                 close,
 
                 /// Returns the return type for the given operation type.
                 /// Can be run on comptime, but not necessarily.
-                pub fn returnType(op: OperationType) type {
+                pub fn Returns(op: OperationType) type {
                     return switch (op) {
                         .none => unreachable,
                         .read => ReadError!usize,
                         .write => WriteError!usize,
+                        .writev => WriteError!usize,
                         .connect => ConnectError!void,
                         .accept => AcceptError!Socket,
                         .recv => RecvError!usize,
                         .send => SendError!usize,
                         .timeout => TimeoutError!void,
-                        .fds_update => UpdateFdsError!i32,
                         .close => void,
                     };
                 }
             };
 
-            // values needed by operations
-            // TODO: hide the io_uring specific operation kinds behind a comptime switch, like `fds_update`.
-            pub const Operation = union(OperationType) {
-                // fds_update comptime magic
-                pub const FdsUpdate = switch (options.io_uring.direct_descriptors_mode) {
-                    true => struct {
-                        fds: []linux.fd_t,
-                        offset: u32,
-                    },
-                    false => void,
-                };
-
-                // various kinds of cancel operations are supported
-                // https://man7.org/linux/man-pages/man3/io_uring_prep_cancel.3.html
-                //pub const CancelType = enum(u1) { all_io, completion };
-
-                //pub const Cancel = union(CancelType) {
-                //    all_io: Handle,
-                //    completion: *Completion,
-                //};
-
+            // Data needed by operations.
+            pub const Operation = extern union {
                 // default
                 none: void,
-                read: struct {
+                read: extern struct {
+                    base: [*]u8,
+                    len: usize,
                     handle: linux.fd_t,
-                    buffer: []u8,
-                    offset: u64,
+                    __pad: u32 = 0,
                 },
-                write: struct {
+                write: extern struct {
+                    base: [*]const u8,
+                    len: usize,
                     handle: linux.fd_t,
-                    buffer: []const u8,
-                    offset: u64,
+                    __pad: u32 = 0,
                 },
-                connect: struct {
+                writev: extern struct {
+                    iovecs: [*]const posix.iovec,
+                    nr_vecs: u32,
+                    handle: linux.fd_t,
+                },
+                connect: extern struct {
+                    addr: posix.sockaddr = undefined, // 16
                     socket: linux.fd_t,
-                    addr: std.net.Address,
+                    socklen: posix.socklen_t,
                 },
-                // TODO: take `*posix.sockaddr` instead
-                accept: struct {
+                accept: extern struct {
+                    addr: posix.sockaddr = undefined, // 16
                     socket: linux.fd_t, // listener socket
-                    addr: posix.sockaddr = undefined,
-                    addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
+                    socklen: posix.socklen_t = @sizeOf(posix.sockaddr),
                 },
-                recv: struct {
-                    socket: Socket,
-                    buffer: []u8,
-                },
-                send: struct {
+                recv: extern struct {
+                    base: [*]u8,
+                    len: usize,
                     socket: linux.fd_t,
-                    buffer: []const u8,
+                    flags: u32,
                 },
-                timeout: linux.kernel_timespec,
-                fds_update: FdsUpdate,
-                close: HandleOrSocket,
+                send: extern struct {
+                    base: [*]const u8,
+                    len: usize,
+                    socket: linux.fd_t,
+                    flags: u32,
+                },
+                timeout: extern struct {
+                    timespec: linux.kernel_timespec, // 16
+                    __pad: u64 = 0,
+                },
+                close: extern struct {
+                    handle: HandleOrSocket, // 4
+                    __pad: [20]u8 = undefined,
+                },
             };
         };
 
@@ -1180,7 +1155,7 @@ pub fn Loop(comptime options: Options) type {
 }
 
 test "io_uring: direct descriptors" {
-    const DefaultLoop = Loop(.{
+    const DefaultLoop = LoopImpl(.{
         .io_uring = .{
             .direct_descriptors_mode = true,
         },

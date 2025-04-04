@@ -21,9 +21,9 @@ const loop = switch (builtin.os.tag) {
 };
 
 /// Default loop type used in everywhere.
-pub const Loop = loop.Loop(.{
+pub const Loop = loop.LoopImpl(.{
     .io_uring = .{
-        .direct_descriptors_mode = true,
+        .direct_descriptors_mode = false,
         .zero_copy_sends = false,
     },
 });
@@ -41,15 +41,6 @@ pub const invalid_socket = switch (builtin.os.tag) {
 pub const invalid_handle = switch (builtin.os.tag) {
     .windows => windows.INVALID_HANDLE_VALUE,
     else => -1,
-};
-
-const BufferPoolGeneric = @import("io/buffer_pool.zig").BufferPool;
-
-/// Buffer pool that can be used by loop.
-pub const BufferPool = switch (builtin.os.tag) {
-    .linux => BufferPoolGeneric(.io_uring),
-    .windows => BufferPoolGeneric(.iocp),
-    else => @compileError("Buffer pool for this platform is not implemented yet"),
 };
 
 test {
