@@ -14,8 +14,7 @@ method: Method = .unknown,
 path: ?[]const u8 = null,
 /// Requested HTTP version, initially set to 1.0.
 version: Version = .@"1.0",
-/// HTTP headers sent from peer.
-/// We only accept 32 headers at most.
+/// HTTP headers sent from peer. We only accept 32 headers at most.
 headers: [32]Header = undefined,
 /// Length of HTTP headers.
 h_count: usize = 0,
@@ -38,12 +37,26 @@ pub inline fn headerCount(req: *const Request) usize {
 }
 
 /// Returns the header value for the given header key.
-pub fn getHeader(req: *const Request, key: []const u8) ![]const u8 {
+pub fn getHeader(req: *const Request, key: []const u8) ?[]const u8 {
     for (req.headers[0..req.headerCount()]) |h| {
         if (std.mem.eql(u8, h.key, key)) {
             return h.value;
         }
     }
 
-    return error.NotFound;
+    return null;
+}
+
+/// Prints received headers to desired io.Writer. Only used for inspecting headers.
+pub fn printHeaders(req: *const Request, writer: anytype) !void {
+    for (req.headers[0..req.headerCount()]) |header| {
+        try writer.print("{s}: {s}\n", .{ header.key, header.value });
+    }
+}
+
+/// Whether or not HTTP keep-alive is possible.
+pub inline fn isKeepAlive(req: *const Request) bool {
+    // NOTE: We might want to prefer case insensitive check.
+    const connection = req.getHeader("Connection") orelse return false;
+    return std.mem.eql(u8, connection, "keep-alive");
 }
