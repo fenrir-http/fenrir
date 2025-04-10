@@ -515,6 +515,7 @@ pub fn LoopImpl(comptime options: Options) type {
                 .metadata = .{
                     .accept = .{ .socket = s },
                 },
+                .status = .running,
                 .userdata = userdata,
                 .callback = @ptrCast(&(comptime struct {
                     fn wrap(loop: *Loop, c: *Completion) void {
@@ -617,10 +618,7 @@ pub fn LoopImpl(comptime options: Options) type {
                             else => |err| posix.unexpectedErrno(err),
                         } else @intCast(res); // valid
 
-                        const metadata = c.getMetadata(.recv, false);
-                        const buf = metadata[0..metadata.len];
-
-                        @call(.always_inline, callback, .{ c.castUserdata(T), loop, c, buf, result });
+                        @call(.always_inline, callback, .{ c.castUserdata(T), loop, c, c.buffer(), result });
                     }
                 }.wrap,
             };
@@ -1061,6 +1059,25 @@ pub fn LoopImpl(comptime options: Options) type {
                 return @enumFromInt(-completion.result);
             }
 
+            /// Returns the native file descriptor for the operation.
+            /// If the operation does not take a file descriptor, calling this function is invalid behavior.
+            pub inline fn fd(completion: *const Completion) linux.fd_t {
+                const any = completion.metadata.any;
+                return any.handle_or_socket;
+            }
+
+            /// Returns the buffer of the operation metadata.
+            pub inline fn buffer(completion: *const Completion) []u8 {
+                const any = completion.metadata.any;
+                return any.base[0..any.len];
+            }
+
+            /// Returns the network address for the operation.
+            /// Only works on connect and accept operations.
+            pub fn addr(completion: *const Completion) std.net.Address {
+                return .{ .any = completion.metadata.connect.addr };
+            }
+
             // operation kind
             pub const OperationType = enum(u8) {
                 none,
@@ -1095,8 +1112,15 @@ pub fn LoopImpl(comptime options: Options) type {
 
             // Data needed by operations.
             pub const Operation = extern union {
-                // default
+                /// Default.
                 none: void,
+                /// Not really an operation but allows accessing memory regions of union by ease.
+                any: extern struct {
+                    base: [*]u8,
+                    len: usize,
+                    handle_or_socket: linux.fd_t,
+                    __pad: u32 = 0,
+                },
                 read: extern struct {
                     base: [*]u8,
                     len: usize,
@@ -1113,15 +1137,16 @@ pub fn LoopImpl(comptime options: Options) type {
                     iovecs: [*]const posix.iovec,
                     nr_vecs: u32,
                     handle: linux.fd_t,
+                    __pad: u32 = 0,
                 },
                 connect: extern struct {
-                    addr: posix.sockaddr = undefined, // 16
                     socket: linux.fd_t,
+                    addr: posix.sockaddr = undefined, // 16
                     socklen: posix.socklen_t,
                 },
                 accept: extern struct {
-                    addr: posix.sockaddr = undefined, // 16
                     socket: linux.fd_t, // listener socket
+                    addr: posix.sockaddr = undefined, // 16
                     socklen: posix.socklen_t = @sizeOf(posix.sockaddr),
                 },
                 recv: extern struct {

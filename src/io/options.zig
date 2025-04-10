@@ -46,4 +46,10 @@ pub const Options = struct {
     } = .{},
     // TODO:
     iocp: struct {} = .{},
+
+    /// Whether or not direct descriptors mode is activated.
+    /// Only supported for io_uring.
+    pub inline fn directDescriptors(options: *const Options) bool {
+        return options.io_uring.direct_descriptors_mode;
+    }
 };

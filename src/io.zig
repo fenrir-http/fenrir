@@ -1,11 +1,13 @@
-//! Returns async I/O primitives depending on the platform.
+//! Returns I/O primitives depending on the platform.
 
 const std = @import("std");
 const os = std.os;
 const windows = os.windows;
 const builtin = @import("builtin");
 
-pub const IoEngine = @import("io/options.zig").IoEngine;
+const opts = @import("io/options.zig");
+pub const IoEngine = opts.IoEngine;
+pub const Options = opts.Options;
 
 /// Returns the backing I/O engine.
 pub const backing: IoEngine = switch (builtin.os.tag) {
@@ -14,19 +16,21 @@ pub const backing: IoEngine = switch (builtin.os.tag) {
     else => @compileError("I/O engine for this platform is not implemented yet"),
 };
 
-/// Asynchronous event loop implementation.
+/// Event loop implementation.
 const loop = switch (builtin.os.tag) {
     .linux => @import("io/io_uring.zig"),
     else => @compileError("I/O engine for this platform is not implemented yet"),
 };
 
-/// Default loop type used in everywhere.
-pub const Loop = loop.LoopImpl(.{
+pub const options = opts.Options{
     .io_uring = .{
         .direct_descriptors_mode = false,
         .zero_copy_sends = false,
     },
-});
+};
+
+/// Default loop type used in everywhere.
+pub const Loop = loop.LoopImpl(options);
 
 /// FIXME: usingnamespace might get snapped away from existence.
 pub usingnamespace Loop;
